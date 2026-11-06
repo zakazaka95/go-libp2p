@@ -1,0 +1,200 @@
+name: Review readiness - go-libp2p Linux
+
+"on":
+  push:
+    branches: [validation/review-ready-2026-11-06]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    if: github.repository == 'zakazaka95/go-libp2p'
+    name: ${{ matrix.source.change }} / Go ${{ matrix.go }} / ${{ matrix.suite }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.26.10', '1.27.3']
+        suite: [unit, race]
+        source:
+          - change: distinct-protocol-limits
+            head: 30313d218d350659ad38f3c296b7cb2641a0af7a
+            tree: 81d3089b0fa700955c5e69d2ae2fd60f18203a39
+          - change: unlimited-discovery
+            head: cdf86b1f13e1d8fb0af456ea96b5f3833d0fb2a0
+            tree: 6ebd9bbe268f593d95b6acca2d59eea90aa2e06a
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      GOTOOLCHAIN: local
+      CGO_ENABLED: '1'
+      GOMAXPROCS: '2'
+    steps:
+      - name: Check out the exact published source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zakazaka95/go-libp2p
+          ref: ${{ matrix.source.head }}
+          path: source
+          submodules: recursive
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify source identity
+        env:
+          EXPECTED_HEAD: ${{ matrix.source.head }}
+          EXPECTED_TREE: ${{ matrix.source.tree }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test -z "$(git status --porcelain)"
+          printf 'Validated source HEAD: %s\nSource tree: %s\n' "$EXPECTED_HEAD" "$EXPECTED_TREE"
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Show the actual toolchain
+        run: go version
+      - name: Set the Linux UDP buffer used by the upstream test setup
+        run: sudo sysctl -w net.core.rmem_max=2500000
+      - name: Install the upstream test-result and retry tools
+        run: |
+          set -euo pipefail
+          cd scripts/test_analysis
+          go install ./cmd/gotest2sql
+          go install .
+      - name: Run the upstream no-coverage cases
+        if: matrix.suite == 'unit'
+        run: go test -tags nocover -run NoCover -v ./...
+      - name: Run the Go 1.26 synctest cases
+        if: matrix.suite == 'unit' && matrix.go == '1.26.10'
+        run: go test -run '_synctest$' -v ./...
+      - name: Run every root and nested-module suite
+        env:
+          VALIDATION_SUITE: ${{ matrix.suite }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' module; do
+            (
+              cd "$(dirname "$module")"
+              printf '\nModule: %s\n' "$PWD"
+              result=0
+              if [[ "$VALIDATION_SUITE" == race ]]; then
+                test_analysis -race -shuffle=on -v || result=$?
+              else
+                test_analysis -shuffle=on -v -cover -coverprofile=module-coverage.txt -coverpkg=./... || result=$?
+              fi
+              test_analysis summarize
+              exit "$result"
+            )
+          done < <(find . \( -name vendor -o -name '[._].*' -o -name node_modules \) -prune -o -name go.mod -print0 | sort -z)
+
+  checks:
+    if: github.repository == 'zakazaka95/go-libp2p'
+    name: ${{ matrix.change }} / format, tidy, vet, lint, generation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - change: distinct-protocol-limits
+            head: 30313d218d350659ad38f3c296b7cb2641a0af7a
+            tree: 81d3089b0fa700955c5e69d2ae2fd60f18203a39
+          - change: unlimited-discovery
+            head: cdf86b1f13e1d8fb0af456ea96b5f3833d0fb2a0
+            tree: 6ebd9bbe268f593d95b6acca2d59eea90aa2e06a
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      GOTOOLCHAIN: local
+      CGO_ENABLED: '1'
+      GOMAXPROCS: '2'
+      PUBLISHED_BASE: 03349944847387886bf06b65993b2a03c1e6d12d
+    steps:
+      - name: Check out the exact published source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zakazaka95/go-libp2p
+          ref: ${{ matrix.head }}
+          path: source
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source identity
+        env:
+          EXPECTED_HEAD: ${{ matrix.head }}
+          EXPECTED_TREE: ${{ matrix.tree }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test -z "$(git status --porcelain)"
+          git cat-file -e "$PUBLISHED_BASE^{commit}"
+          printf 'Validated source HEAD: %s\nSource tree: %s\n' "$EXPECTED_HEAD" "$EXPECTED_TREE"
+      - name: Set up the Go 1.26 check toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.26.10'
+          cache: false
+      - name: Install the check tools pinned by upstream Go Checks v1.0 for Go 1.26
+        run: |
+          set -euo pipefail
+          go install honnef.co/go/tools/cmd/staticcheck@ff63afafc529279f454e02f1d060210bd4263951
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@5d1e709b7be35cb2025444e19de266b056b7b7ee
+          go version
+          staticcheck -version
+          golangci-lint version
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -s -l .)
+          test -z "$unformatted" || { printf '%s\n' "$unformatted"; exit 1; }
+      - name: Check tidy, vet, staticcheck and PR-scoped lint in every module
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' module; do
+            (
+              cd "$(dirname "$module")"
+              printf '\nModule: %s\n' "$PWD"
+              go mod tidy
+              test -z "$(git ls-files --others --exclude-standard -- go.sum)"
+              git diff --exit-code -- go.mod go.sum
+              go vet ./...
+              staticcheck ./...
+              # Upstream applies the original PR base for unchanged Go/config files.
+              golangci-lint run --disable govet --disable staticcheck --new=false --new-from-patch= --new-from-rev="$PUBLISHED_BASE" --verbose
+            )
+          done < <(find . \( -name vendor -o -name '[._].*' -o -name node_modules \) -prune -o -name go.mod -print0 | sort -z)
+      - name: Verify all generated code with the upstream protoc-comment normalization
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          find . -name '*.pb.go' -print0 | xargs -0 -r sed -i '/^\/\/.*protoc.*v/d'
+          git add -A
+          normalized_before=$(git write-tree)
+          while IFS= read -r -d '' module; do
+            (cd "$(dirname "$module")" && go generate -x ./...)
+          done < <(find . \( -name vendor -o -name '[._].*' -o -name node_modules \) -prune -o -name go.mod -print0 | sort -z)
+          find . -name '*.pb.go' -print0 | xargs -0 -r sed -i '/^\/\/.*protoc.*v/d'
+          git add -A
+          normalized_after=$(git write-tree)
+          if [[ "$normalized_after" != "$normalized_before" ]]; then
+            git diff "$normalized_before" "$normalized_after"
+            exit 1
+          fi
+      - name: Confirm source commit was not changed
+        env:
+          EXPECTED_HEAD: ${{ matrix.head }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
